@@ -10,7 +10,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse, parse_qs
 
 from telegram import Update
 from telegram.constants import ChatAction
@@ -125,16 +125,121 @@ def write_cookies_if_configured(workdir: Path) -> Path | None:
     return cookie_path
 
 
+class DownloadTimeoutError(RuntimeError):
+    pass
+
+
+def download_hint(output: str) -> str:
+    # Report only fixed categories: downloader output can contain session cookies.
+    lower = output.lower()
+    if "429" in lower or "rate limit" in lower or "too many requests" in lower:
+        return "instagram reported rate limiting"
+    if any(word in lower for word in ("login", "401", "403", "challenge", "checkpoint")):
+        return "instagram reported an access or login restriction"
+    if any(word in lower for word in ("timeout", "timed out", "connectionerror", "connection error")):
+        return "the downloader reported a network timeout or connection failure"
+    return "no specific cause was reported by the downloader"
+
+
 async def run_gallery_dl(url: str, output_dir: Path, cookie_path: Path | None) -> tuple[int, str]:
     cmd = [
         sys.executable, "-m", "gallery_dl", "--config-ignore", "--no-input", "--warning",
         "--directory", str(output_dir), "--range", f"1-{MAX_FILES}",
         "-o", "cache.file=:memory:", "-o", "extractor.instagram.user-cache=memory",
-        "-o", 'downloader.ytdl.raw-options={"cachedir":false}',
+        "-o", "extractor.retries=2", "-o", "extractor.timeout=20",
+        "-o", "downloader.http.retries=2", "-o", "downloader.http.timeout=20",
+        "-o", 'downloader.ytdl.raw-options={"cachedir":false,"socket_timeout":20,"retries":2,"fragment_retries":2}',
     ]
     if cookie_path:
         cmd.extend(["--cookies", str(cookie_path)])
     cmd.append(url)
+    return await run_download_process(cmd, output_dir, cookie_path)
+
+
+async def run_instagram_download(url: str, output_dir: Path, cookie_path: Path | None) -> tuple[int, str]:
+    cmd = [sys.executable, str(Path(__file__).resolve()), "--download-worker", url, str(output_dir)]
+    if cookie_path:
+        cmd.append(str(cookie_path))
+    return await run_download_process(cmd, output_dir, cookie_path)
+
+
+def select_photo_url(thumbnails: list[dict]) -> str:
+    candidates = []
+    for index, item in enumerate(thumbnails):
+        url = item.get("url", "")
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme != "https" or not any(host.endswith("." + domain) or host == domain
+                                                 for domain in ("cdninstagram.com", "fbcdn.net")):
+            continue
+        transform = parse_qs(parsed.query).get("stp", [""])[0]
+        cropped = bool(re.search(r"(?:^|_)c\d+\.\d+\.", transform))
+        scaled = re.search(r"(?:^|_)[sp](\d+)x(\d+)", transform)
+        area = (int(scaled[1]) * int(scaled[2]) if scaled
+                else (item.get("width") or 0) * (item.get("height") or 0))
+        candidates.append(((not cropped, not scaled, area, index), url))
+    if not candidates:
+        raise RuntimeError("No downloadable Instagram image found")
+    return max(candidates)[1]
+
+
+def download_worker(url: str, output_dir: Path, cookie_path: Path | None) -> int:
+    from yt_dlp import YoutubeDL
+    from yt_dlp.networking import Request
+
+    options = {
+        "quiet": True, "no_warnings": True, "cachedir": False,
+        "compat_opts": {"no-certifi"}, "socket_timeout": 20,
+        "retries": 2, "fragment_retries": 2, "extractor_retries": 1,
+        "ignore_no_formats_error": True, "playlistend": MAX_FILES,
+        "format": "bestvideo*+bestaudio/best", "merge_output_format": "mp4",
+    }
+    if cookie_path:
+        options["cookiefile"] = str(cookie_path)
+    failures = 0
+    try:
+        with YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if not info:
+                raise RuntimeError("No Instagram media metadata found")
+            entries = info.get("entries") if info.get("_type") == "playlist" else [info]
+            for index, entry in enumerate(entries or [], 1):
+                if index > MAX_FILES:
+                    break
+                try:
+                    if not entry:
+                        raise RuntimeError("Unavailable carousel entry")
+                    if entry.get("formats"):
+                        video_options = {**options, "ignore_no_formats_error": False,
+                                         "outtmpl": str(output_dir / f"{index:03d}_%(id)s.%(ext)s")}
+                        with YoutubeDL(video_options) as video_ydl:
+                            video_ydl.process_ie_result(entry, download=True)
+                    else:
+                        image_url = select_photo_url(entry.get("thumbnails", []))
+                        path = output_dir / f"{index:03d}_photo.jpg"
+                        partial = path.with_suffix(".jpg.part")
+                        with ydl.urlopen(Request(image_url, headers={"Referer": "https://www.instagram.com/"})) as response:
+                            content_type = response.headers.get("Content-Type", "").split(";")[0].lower()
+                            extensions = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
+                            if content_type not in extensions:
+                                raise RuntimeError("Instagram image response was not a supported image")
+                            path = path.with_suffix(extensions[content_type])
+                            with partial.open("wb") as stream:
+                                while chunk := response.read(64 * 1024):
+                                    stream.write(chunk)
+                                    if stream.tell() > MAX_TEMP_MB * 1024 * 1024:
+                                        raise RuntimeError("Image exceeded temporary storage limit")
+                        partial.rename(path)
+                except Exception as exc:
+                    failures += 1
+                    print(f"entry {index} failed: {download_hint(str(exc))}", flush=True)
+        return 1 if failures else 0
+    except Exception as exc:
+        print(download_hint(str(exc)), flush=True)
+        return 1
+
+
+async def run_download_process(cmd: list[str], output_dir: Path, cookie_path: Path | None) -> tuple[int, str]:
 
     logger.info("Starting Instagram download")
     child_env = os.environ.copy()
@@ -152,7 +257,7 @@ async def run_gallery_dl(url: str, output_dir: Path, cookie_path: Path | None) -
     try:
         while not reader.done():
             if asyncio.get_running_loop().time() >= deadline:
-                raise RuntimeError("Instagram download timed out")
+                raise DownloadTimeoutError("Instagram download timed out")
             size = 0
             for path in output_dir.rglob("*"):
                 try:
@@ -175,7 +280,9 @@ async def run_gallery_dl(url: str, output_dir: Path, cookie_path: Path | None) -
         elif proc.returncode is None:
             proc.kill()
         await proc.wait()
-        await reader
+        captured, _ = await reader
+        logger.info("Downloader finished: exit=%s; cookies_configured=%s; hint=%s",
+                    proc.returncode, bool(cookie_path), download_hint(captured.decode("utf-8", errors="replace")))
 
 
 def collect_media_files(output_dir: Path) -> list[Path]:
@@ -240,16 +347,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
             try:
                 cookie_path = write_cookies_if_configured(workdir)
-                returncode, output = await run_gallery_dl(url, output_dir, cookie_path)
+                returncode, output = await run_instagram_download(url, output_dir, cookie_path)
                 media_files = collect_media_files(output_dir)
 
                 if not media_files:
-                    logger.warning("gallery-dl returned %s without media", returncode)
+                    logger.warning("Instagram downloader returned %s without media", returncode)
                     lower = output.lower()
                     if "login" in lower or "cookies" in lower or "401" in lower:
                         text = (
-                            "instagram blocked this request or requires login. "
-                            "configure IG_COOKIES_B64 on the bot server, then try again."
+                            "instagram blocked this request or requires login from this server. "
+                            "try another public post or retry later."
                         )
                     elif "rate" in lower or "429" in lower:
                         text = "instagram is rate-limiting the bot. try again later."
@@ -298,6 +405,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 else:
                     await status.edit_text("the media was downloaded, but every file exceeded the configured telegram upload limit.")
 
+            except DownloadTimeoutError:
+                logger.warning("Instagram download reached the %s-second deadline", DOWNLOAD_TIMEOUT_SECONDS)
+                await status.edit_text(
+                    f"instagram download timed out after {DOWNLOAD_TIMEOUT_SECONDS} seconds. "
+                    "try another public post. if it also fails, check the server's 'Downloader finished' log "
+                    "for a login, rate-limit, or network hint."
+                )
             except Exception as exc:
                 logger.exception("Unhandled download error")
                 await status.edit_text(f"download failed: {type(exc).__name__}. check the bot logs for details.")
@@ -343,4 +457,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 4 and sys.argv[1] == "--download-worker":
+        raise SystemExit(download_worker(sys.argv[2], Path(sys.argv[3]),
+                                        Path(sys.argv[4]) if len(sys.argv) > 4 else None))
     main()
