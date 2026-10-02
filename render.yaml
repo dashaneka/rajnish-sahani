@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: rajnish-sahani
+    runtime: docker
+    plan: free
+    autoDeployTrigger: commit
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ALLOWED_USER_IDS
+        sync: false
+      - key: MAX_UPLOAD_MB
+        value: "49"
+      - key: MAX_CONCURRENT_DOWNLOADS
+        value: "1"
+      - key: DOWNLOAD_TIMEOUT_SECONDS
+        value: "180"
+      - key: MAX_TEMP_MB
+        value: "256"
+      - key: MAX_FILES
+        value: "20"
